@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
+import { runClaudepP } from "./claudep-runner.js";
 import { formatThinkingLevels, normalizeThinkLevel } from "../auto-reply/thinking.js";
 import { DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH } from "../config/agent-limits.js";
 import { loadConfig } from "../config/config.js";
@@ -14,7 +15,6 @@ import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import type { SubagentLifecycleHookRunner } from "../plugins/hooks.js";
 import {
   isValidAgentId,
-  isCronSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
 } from "../routing/session-key.js";
@@ -37,7 +37,7 @@ import {
 } from "./subagent-attachments.js";
 import { resolveSubagentCapabilities } from "./subagent-capabilities.js";
 import { getSubagentDepthFromSessionStore } from "./subagent-depth.js";
-import { countActiveRunsForSession, registerSubagentRun } from "./subagent-registry.js";
+import { countActiveRunsForSession } from "./subagent-registry.js";
 import { readStringParam } from "./tools/common.js";
 import {
   resolveDisplaySessionKey,
@@ -164,14 +164,6 @@ async function callSubagentGateway(
     ...params,
     ...(scopes != null ? { scopes } : {}),
   });
-}
-
-function readGatewayRunId(response: Awaited<ReturnType<typeof callGateway>>): string | undefined {
-  if (!response || typeof response !== "object") {
-    return undefined;
-  }
-  const { runId } = response as { runId?: unknown };
-  return typeof runId === "string" && runId ? runId : undefined;
 }
 
 function loadSubagentConfig() {
@@ -714,39 +706,30 @@ export async function spawnSubagentDirect(
     };
   }
 
-  const childIdem = crypto.randomUUID();
-  let childRunId: string = childIdem;
-  try {
-    const {
-      spawnedBy: _spawnedBy,
-      workspaceDir: _workspaceDir,
-      ...publicSpawnedMetadata
-    } = spawnedMetadata;
-    const response = await callSubagentGateway({
-      method: "agent",
-      params: {
-        message: childTaskMessage,
-        sessionKey: childSessionKey,
-        channel: requesterOrigin?.channel,
-        to: requesterOrigin?.to ?? undefined,
-        accountId: requesterOrigin?.accountId ?? undefined,
-        threadId: requesterOrigin?.threadId != null ? String(requesterOrigin.threadId) : undefined,
-        idempotencyKey: childIdem,
-        deliver: false,
-        lane: AGENT_LANE_SUBAGENT,
-        extraSystemPrompt: childSystemPrompt,
-        thinking: thinkingOverride,
-        timeout: runTimeoutSeconds,
-        label: label || undefined,
-        ...publicSpawnedMetadata,
-      },
-      timeoutMs: 10_000,
+  // [claudep-fork] Subagent execution via claudep -p.
+  // Instead of dispatching through the gateway agent RPC, we spawn a standalone
+  // Claude instance with full personality/hooks/memory. The result is delivered
+  // back to the parent session via a gateway "agent" call when the process exits.
+  const childRunId = crypto.randomUUID();
+
+  // Build the full prompt including system context and the task.
+  const claudepPrompt = [
+    childSystemPrompt,
+    "",
+    childTaskMessage,
+  ].join("\n");
+
+  // Fire-and-forget: spawn the claudep process and deliver result on exit.
+  void (async () => {
+    const timeoutMs = runTimeoutSeconds ? runTimeoutSeconds * 1000 : 10 * 60 * 1000;
+    const result = await runClaudepP({
+      prompt: claudepPrompt,
+      context: `subagent:${targetAgentId}:${label || childRunId}`,
+      timeoutMs,
+      workingDir: spawnedMetadata.workspaceDir,
     });
-    const runId = readGatewayRunId(response);
-    if (runId) {
-      childRunId = runId;
-    }
-  } catch (err) {
+
+    // Clean up attachments after run.
     if (attachmentAbsDir) {
       try {
         await fs.rm(attachmentAbsDir, { recursive: true, force: true });
@@ -754,162 +737,62 @@ export async function spawnSubagentDirect(
         // Best-effort cleanup only.
       }
     }
-    let emitLifecycleHooks = false;
-    if (threadBindingReady) {
-      const hasEndedHook = hookRunner?.hasHooks("subagent_ended") === true;
-      let endedHookEmitted = false;
-      if (hasEndedHook) {
-        try {
-          await hookRunner?.runSubagentEnded(
-            {
-              targetSessionKey: childSessionKey,
-              targetKind: "subagent",
-              reason: "spawn-failed",
-              sendFarewell: true,
-              accountId: requesterOrigin?.accountId,
-              runId: childRunId,
-              outcome: "error",
-              error: "Session failed to start",
-            },
-            {
-              runId: childRunId,
-              childSessionKey,
-              requesterSessionKey: requesterInternalKey,
-            },
-          );
-          endedHookEmitted = true;
-        } catch {
-          // Spawn should still return an actionable error even if cleanup hooks fail.
-        }
-      }
-      emitLifecycleHooks = !endedHookEmitted;
-    }
-    // Always delete the provisional child session after a failed spawn attempt.
-    // If we already emitted subagent_ended above, suppress a duplicate lifecycle hook.
+
+    // Deliver result back to the parent session as an internal agent event.
+    const statusLabel =
+      result.status === "ok"
+        ? "completed successfully"
+        : result.status === "timeout"
+          ? "timed out"
+          : `failed: ${result.error ?? "unknown error"}`;
+    const outputPreview = result.output || "(no output)";
+    const announcement = [
+      `## Subagent Result`,
+      "",
+      `**Task:** ${task}`,
+      `**Label:** ${label || "(none)"}`,
+      `**Status:** ${statusLabel}`,
+      `**Duration:** ${Math.round(result.durationMs / 1000)}s`,
+      "",
+      outputPreview,
+    ].join("\n");
+
     try {
       await callSubagentGateway({
-        method: "sessions.delete",
+        method: "agent",
         params: {
-          key: childSessionKey,
-          deleteTranscript: true,
-          emitLifecycleHooks,
+          message: announcement,
+          sessionKey: requesterInternalKey,
+          channel: requesterOrigin?.channel,
+          to: requesterOrigin?.to ?? undefined,
+          accountId: requesterOrigin?.accountId ?? undefined,
+          threadId:
+            requesterOrigin?.threadId != null ? String(requesterOrigin.threadId) : undefined,
+          deliver: false,
+          lane: AGENT_LANE_SUBAGENT,
+          idempotencyKey: crypto.randomUUID(),
         },
-        timeoutMs: 10_000,
+        timeoutMs: 30_000,
       });
     } catch {
-      // Best-effort only.
+      // Best-effort delivery — result is logged in clawtracker.txt regardless.
     }
-    const messageText = summarizeError(err);
-    return {
-      status: "error",
-      error: messageText,
-      childSessionKey,
-      runId: childRunId,
-    };
-  }
 
-  try {
-    registerSubagentRun({
-      runId: childRunId,
-      childSessionKey,
-      controllerSessionKey: requesterInternalKey,
-      requesterSessionKey: requesterInternalKey,
-      requesterOrigin,
-      requesterDisplayKey,
-      task,
-      cleanup,
+    // Emit lifecycle event for the UI.
+    emitSessionLifecycleEvent({
+      sessionKey: childSessionKey,
+      reason: "subagent-status",
+      parentSessionKey: requesterInternalKey,
       label: label || undefined,
-      model: resolvedModel,
-      workspaceDir: spawnedMetadata.workspaceDir,
-      runTimeoutSeconds,
-      expectsCompletionMessage,
-      spawnMode,
-      attachmentsDir: attachmentAbsDir,
-      attachmentsRootDir: attachmentRootDir,
-      retainAttachmentsOnKeep: retainOnSessionKeep,
     });
-  } catch (err) {
-    if (attachmentAbsDir) {
-      try {
-        await fs.rm(attachmentAbsDir, { recursive: true, force: true });
-      } catch {
-        // Best-effort cleanup only.
-      }
-    }
-    try {
-      await callSubagentGateway({
-        method: "sessions.delete",
-        params: {
-          key: childSessionKey,
-          deleteTranscript: true,
-          emitLifecycleHooks: threadBindingReady,
-        },
-        timeoutMs: 10_000,
-      });
-    } catch {
-      // Best-effort cleanup only.
-    }
-    return {
-      status: "error",
-      error: `Failed to register subagent run: ${summarizeError(err)}`,
-      childSessionKey,
-      runId: childRunId,
-    };
-  }
-
-  if (hookRunner?.hasHooks("subagent_spawned")) {
-    try {
-      await hookRunner.runSubagentSpawned(
-        {
-          runId: childRunId,
-          childSessionKey,
-          agentId: targetAgentId,
-          label: label || undefined,
-          requester: {
-            channel: requesterOrigin?.channel,
-            accountId: requesterOrigin?.accountId,
-            to: requesterOrigin?.to,
-            threadId: requesterOrigin?.threadId,
-          },
-          threadRequested: requestThreadBinding,
-          mode: spawnMode,
-        },
-        {
-          runId: childRunId,
-          childSessionKey,
-          requesterSessionKey: requesterInternalKey,
-        },
-      );
-    } catch {
-      // Spawn should still return accepted if spawn lifecycle hooks fail.
-    }
-  }
-
-  // Emit lifecycle event so the gateway can broadcast sessions.changed to SSE subscribers.
-  emitSessionLifecycleEvent({
-    sessionKey: childSessionKey,
-    reason: "create",
-    parentSessionKey: requesterInternalKey,
-    label: label || undefined,
-  });
-
-  // Check if we're in a cron isolated session - don't add "do not poll" note
-  // because cron sessions end immediately after the agent produces a response,
-  // so the agent needs to wait for subagent results to keep the turn alive.
-  const isCronSession = isCronSessionKey(ctx.agentSessionKey);
-  const note =
-    spawnMode === "session"
-      ? SUBAGENT_SPAWN_SESSION_ACCEPTED_NOTE
-      : isCronSession
-        ? undefined
-        : SUBAGENT_SPAWN_ACCEPTED_NOTE;
+  })();
 
   return {
     status: "accepted",
     childSessionKey,
     runId: childRunId,
     mode: spawnMode,
-    note,
+    note: "Running via claudep -p. Result will be delivered when complete.",
     modelApplied: resolvedModel ? modelApplied : undefined,
     attachments: attachmentsReceipt,
   };

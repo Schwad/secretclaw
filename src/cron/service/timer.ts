@@ -1,6 +1,7 @@
+import { runClaudepP } from "../../agents/claudep-runner.js";
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
-import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
+import { callGateway, randomIdempotencyKey } from "../../gateway/call.js";
 import { DEFAULT_AGENT_ID } from "../../routing/session-key.js";
 import {
   completeTaskRunByRunId,
@@ -1151,13 +1152,15 @@ export async function executeJobCore(
 }
 
 async function executeMainSessionCronJob(
-  state: CronServiceState,
+  _state: CronServiceState,
   job: CronJob,
   abortSignal: AbortSignal | undefined,
-  waitWithAbort: (ms: number) => Promise<void>,
+  _waitWithAbort: (ms: number) => Promise<void>,
 ): Promise<
   CronRunOutcome & CronRunTelemetry & { delivered?: boolean; deliveryAttempted?: boolean }
 > {
+  // [claudep-fork] Main session crons now run as independent claudep -p
+  // instances instead of injecting events into the live conversation.
   const text = resolveJobPayloadTextForMain(job);
   if (!text) {
     const kind = job.payload.kind;
@@ -1169,89 +1172,60 @@ async function executeMainSessionCronJob(
           : 'main job requires payload.kind="systemEvent"',
     };
   }
-  const targetMainSessionKey = job.sessionKey;
-  state.deps.enqueueSystemEvent(text, {
-    agentId: job.agentId,
-    sessionKey: targetMainSessionKey,
-    contextKey: `cron:${job.id}`,
-  });
-  if (job.wakeMode === "now" && state.deps.runHeartbeatOnce) {
-    const reason = `cron:${job.id}`;
-    const isRecurringJob = job.schedule.kind !== "at";
-    const maxWaitMs = state.deps.wakeNowHeartbeatBusyMaxWaitMs ?? 2 * 60_000;
-    const retryDelayMs = state.deps.wakeNowHeartbeatBusyRetryDelayMs ?? 250;
-    const waitStartedAt = state.deps.nowMs();
 
-    let heartbeatResult: HeartbeatRunResult;
-    for (;;) {
-      if (abortSignal?.aborted) {
-        return { status: "error", error: timeoutErrorMessage() };
-      }
-      heartbeatResult = await state.deps.runHeartbeatOnce({
-        reason,
-        agentId: job.agentId,
-        sessionKey: targetMainSessionKey,
-        heartbeat: { target: "last" },
+  const res = await runClaudepP({
+    prompt: text,
+    context: `cron-main:${job.id}`,
+    abortSignal,
+    timeoutMs: resolveCronJobTimeoutMs(job) || undefined,
+  });
+
+  // Deliver output to channel if job has a delivery target.
+  let delivered = false;
+  let deliveryAttempted = false;
+  const delivery = resolveCronDeliveryPlan(job);
+  if (delivery.requested && delivery.channel && delivery.to && res.output) {
+    deliveryAttempted = true;
+    try {
+      await callGateway({
+        method: "send",
+        params: {
+          to: delivery.to,
+          message: res.output,
+          channel: delivery.channel,
+          accountId: delivery.accountId ?? undefined,
+          threadId: delivery.threadId != null ? String(delivery.threadId) : undefined,
+          idempotencyKey: randomIdempotencyKey(),
+        },
+        timeoutMs: 30_000,
       });
-      if (heartbeatResult.status !== "skipped" || heartbeatResult.reason !== "requests-in-flight") {
-        break;
-      }
-      if (isRecurringJob) {
-        // Recurring main-session cron jobs should not hold the cron lane open
-        // while the main lane is busy, or their measured duration starts to
-        // reflect queue wait instead of cron bookkeeping (#58833).
-        state.deps.requestHeartbeatNow({
-          reason,
-          agentId: job.agentId,
-          sessionKey: targetMainSessionKey,
-        });
-        return { status: "ok", summary: text };
-      }
-      if (abortSignal?.aborted) {
-        return { status: "error", error: timeoutErrorMessage() };
-      }
-      if (state.deps.nowMs() - waitStartedAt > maxWaitMs) {
-        if (abortSignal?.aborted) {
-          return { status: "error", error: timeoutErrorMessage() };
-        }
-        state.deps.requestHeartbeatNow({
-          reason,
-          agentId: job.agentId,
-          sessionKey: targetMainSessionKey,
-        });
-        return { status: "ok", summary: text };
-      }
-      await waitWithAbort(retryDelayMs);
+      delivered = true;
+    } catch {
+      // Delivery is best-effort — run itself succeeded.
     }
-
-    if (heartbeatResult.status === "ran") {
-      return { status: "ok", summary: text };
-    }
-    if (heartbeatResult.status === "skipped") {
-      return { status: "skipped", error: heartbeatResult.reason, summary: text };
-    }
-    return { status: "error", error: heartbeatResult.reason, summary: text };
   }
 
-  if (abortSignal?.aborted) {
-    return { status: "error", error: timeoutErrorMessage() };
-  }
-  state.deps.requestHeartbeatNow({
-    reason: `cron:${job.id}`,
-    agentId: job.agentId,
-    sessionKey: targetMainSessionKey,
-  });
-  return { status: "ok", summary: text };
+  return {
+    status: res.status === "ok" ? "ok" : "error",
+    error: res.error,
+    summary: res.output || text,
+    delivered,
+    deliveryAttempted,
+  };
 }
 
 async function executeDetachedCronJob(
-  state: CronServiceState,
+  _state: CronServiceState,
   job: CronJob,
   abortSignal: AbortSignal | undefined,
   resolveAbortError: () => { status: "error"; error: string },
 ): Promise<
   CronRunOutcome & CronRunTelemetry & { delivered?: boolean; deliveryAttempted?: boolean }
 > {
+  // [claudep-fork] Detached cron jobs now run as independent claudep -p
+  // instances. All model selection, session management, and retry logic
+  // is delegated to Claude Code's own infrastructure via the personality
+  // pipeline (hooks, CLAUDE.md, memories).
   if (job.payload.kind !== "agentTurn") {
     return { status: "skipped", error: "isolated job requires payload.kind=agentTurn" };
   }
@@ -1259,27 +1233,49 @@ async function executeDetachedCronJob(
     return resolveAbortError();
   }
 
-  const res = await state.deps.runIsolatedAgentJob({
-    job,
-    message: job.payload.message,
+  const timeoutMs = resolveCronJobTimeoutMs(job) || undefined;
+  const res = await runClaudepP({
+    prompt: job.payload.message,
+    context: `cron:${job.id}`,
     abortSignal,
+    timeoutMs,
   });
 
   if (abortSignal?.aborted) {
     return { status: "error", error: timeoutErrorMessage() };
   }
 
+  // Deliver output to channel if job has a delivery target.
+  let delivered = false;
+  let deliveryAttempted = false;
+  const delivery = resolveCronDeliveryPlan(job);
+  if (delivery.requested && delivery.channel && delivery.to && res.output) {
+    deliveryAttempted = true;
+    try {
+      await callGateway({
+        method: "send",
+        params: {
+          to: delivery.to,
+          message: res.output,
+          channel: delivery.channel,
+          accountId: delivery.accountId ?? undefined,
+          threadId: delivery.threadId != null ? String(delivery.threadId) : undefined,
+          idempotencyKey: randomIdempotencyKey(),
+        },
+        timeoutMs: 30_000,
+      });
+      delivered = true;
+    } catch {
+      // Delivery is best-effort — the run itself succeeded.
+    }
+  }
+
   return {
-    status: res.status,
+    status: res.status === "ok" ? "ok" : "error",
     error: res.error,
-    summary: res.summary,
-    delivered: res.delivered,
-    deliveryAttempted: res.deliveryAttempted,
-    sessionId: res.sessionId,
-    sessionKey: res.sessionKey,
-    model: res.model,
-    provider: res.provider,
-    usage: res.usage,
+    summary: res.output || job.payload.message,
+    delivered,
+    deliveryAttempted,
   };
 }
 
