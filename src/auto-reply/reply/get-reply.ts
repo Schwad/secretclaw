@@ -192,10 +192,16 @@ export async function getReplyFromConfig(
     agentCfg?.typingIntervalSeconds ?? sessionCfg?.typingIntervalSeconds;
   const typingIntervalSeconds =
     typeof configuredTypingSeconds === "number" ? configuredTypingSeconds : 6;
+  // [claudep-fork] Typing TTL override. Default is 2 minutes, but claudep -p
+  // turns can legitimately take 10-25 minutes when Philippe is batching CLI
+  // calls. Override via CLAUDEP_TYPING_TTL_MS env var on the gateway plist.
+  const envTypingTtl = Number(process.env.CLAUDEP_TYPING_TTL_MS);
+  const typingTtlMs = Number.isFinite(envTypingTtl) && envTypingTtl > 0 ? envTypingTtl : undefined;
   const typing = createTypingController({
     onReplyStart: opts?.onReplyStart,
     onCleanup: opts?.onTypingCleanup,
     typingIntervalSeconds,
+    typingTtlMs,
     silentToken: SILENT_REPLY_TOKEN,
     log: defaultRuntime.log,
   });
