@@ -175,6 +175,12 @@ export type SessionEntry = {
   cliSessionIds?: Record<string, string>;
   cliSessionBindings?: Record<string, CliSessionBinding>;
   claudeCliSessionId?: string;
+  /** [claudep-fork] Persistent Claude Code session UUID used when routing main chat through `claude -p --session-id`. */
+  claudeCodeSessionId?: string;
+  /** [claudep-fork] True once the first message has been dispatched for the current claudeCodeSessionId. */
+  claudeCodeSessionInitialized?: boolean;
+  /** [claudep-fork] Turn counter for the current claudeCodeSessionId; used to trigger rollover. */
+  claudeCodeTurnCount?: number;
   label?: string;
   displayName?: string;
   channel?: string;

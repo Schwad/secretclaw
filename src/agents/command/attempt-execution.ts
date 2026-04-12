@@ -17,9 +17,15 @@ import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js
 import { sanitizeForLog } from "../../terminal/ansi.js";
 import { resolveMessageChannel } from "../../utils/message-channel.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../bootstrap-budget.js";
+import {
+  newSessionState,
+  runClaudepPWithSession,
+  type ClaudepRunWithSessionResult,
+} from "../claudep-runner.js";
 import { runCliAgent } from "../cli-runner.js";
 import { clearCliSession, getCliSessionBinding, setCliSessionBinding } from "../cli-session.js";
 import { FailoverError } from "../failover-error.js";
+import type { EmbeddedPiRunResult } from "../pi-embedded-runner/types.js";
 import { formatAgentInternalEventsForPrompt } from "../internal-events.js";
 import { hasInternalRuntimeContext } from "../internal-runtime-context.js";
 import { isCliProvider } from "../model-selection.js";
@@ -345,6 +351,33 @@ export function runAgentAttempt(params: {
     params.providerOverride === params.authProfileProvider
       ? params.sessionEntry?.authProfileOverride
       : undefined;
+
+  // [claudep-fork] Main chat via claudep -p --session-id.
+  // When OPENCLAW_CLAUDEP_MAIN_CHAT=1 is set, the main agent's execution is
+  // routed through the Claude Max subscription (claudep -p) instead of the
+  // embedded Pi agent. This preserves Philippe's personality and memory
+  // continuity without burning API tokens on every turn.
+  if (
+    process.env.OPENCLAW_CLAUDEP_MAIN_CHAT === "1" &&
+    params.sessionAgentId === "main" &&
+    (params.sessionEntry?.spawnDepth ?? 0) === 0
+  ) {
+    return runMainChatViaClaudep({
+      cfg: params.cfg,
+      sessionEntry: params.sessionEntry,
+      sessionKey: params.sessionKey,
+      sessionStore: params.sessionStore,
+      storePath: params.storePath,
+      sessionFile: params.sessionFile,
+      workspaceDir: params.workspaceDir,
+      prompt: effectivePrompt,
+      abortSignal: params.opts.abortSignal,
+      timeoutMs: params.timeoutMs,
+      providerOverride: params.providerOverride,
+      modelOverride: params.modelOverride,
+    });
+  }
+
   if (isCliProvider(params.providerOverride, params.cfg)) {
     const cliSessionBinding = getCliSessionBinding(params.sessionEntry, params.providerOverride);
     const runCliWithSession = (nextCliSessionId: string | undefined) =>
@@ -479,6 +512,154 @@ export function runAgentAttempt(params: {
     bootstrapPromptWarningSignaturesSeen,
     bootstrapPromptWarningSignature,
   });
+}
+
+/**
+ * [claudep-fork] Run a live main-chat turn through `claudep -p --session-id`.
+ *
+ * Routes the message to Claude Code via a shell-out, using a per-openclaw-session
+ * Claude Code session UUID stored on the session entry. This lets every turn of
+ * every Telegram conversation hit Nick's Claude Max subscription instead of API
+ * tokens, while preserving conversation continuity across turns via `--resume`.
+ *
+ * Graceful error handling: on spawn/execution failure, returns an error payload
+ * the caller can deliver to the user. Falls back from --resume to --session-id
+ * to new-session as needed. Rollover is handled by runClaudepPWithSession.
+ */
+async function runMainChatViaClaudep(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  sessionEntry: SessionEntry | undefined;
+  sessionKey: string | undefined;
+  sessionStore?: Record<string, SessionEntry>;
+  storePath?: string;
+  sessionFile: string;
+  workspaceDir: string;
+  prompt: string;
+  abortSignal?: AbortSignal;
+  timeoutMs: number;
+  providerOverride: string;
+  modelOverride: string;
+}): Promise<EmbeddedPiRunResult> {
+  const startedAt = Date.now();
+
+  // Resolve or initialize the Claude Code session state from the openclaw
+  // session entry. If the entry is missing, fall back to an in-memory state
+  // (the session will be ephemeral until it gets persisted).
+  const existingSessionId = params.sessionEntry?.claudeCodeSessionId;
+  const existingInitialized = params.sessionEntry?.claudeCodeSessionInitialized ?? false;
+  const existingTurnCount = params.sessionEntry?.claudeCodeTurnCount ?? 0;
+
+  const state = existingSessionId
+    ? {
+        sessionId: existingSessionId,
+        initialized: existingInitialized,
+        turnCount: existingTurnCount,
+      }
+    : newSessionState();
+
+  const ctx = params.sessionKey
+    ? `main:${sanitizeForLog(params.sessionKey)}`
+    : "main:unknown";
+
+  const persistState = async (next: typeof state) => {
+    if (!params.sessionKey || !params.sessionStore || !params.storePath) {
+      return;
+    }
+    const baseEntry = params.sessionStore[params.sessionKey] ?? params.sessionEntry ?? {};
+    const updatedEntry: SessionEntry = {
+      ...baseEntry,
+      claudeCodeSessionId: next.sessionId,
+      claudeCodeSessionInitialized: next.initialized,
+      claudeCodeTurnCount: next.turnCount,
+      updatedAt: Date.now(),
+    };
+    await persistSessionEntry({
+      sessionStore: params.sessionStore,
+      sessionKey: params.sessionKey,
+      storePath: params.storePath,
+      entry: updatedEntry,
+    });
+  };
+
+  // Persist initial state so the session ID is durable even if claudep crashes.
+  await persistState(state);
+
+  let result: ClaudepRunWithSessionResult;
+  try {
+    result = await runClaudepPWithSession({
+      context: ctx,
+      prompt: params.prompt,
+      state,
+      onStateUpdate: persistState,
+      abortSignal: params.abortSignal,
+      timeoutMs: params.timeoutMs,
+      workingDir: params.workspaceDir,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      payloads: [
+        {
+          text: `Philippe had a moment. (${message})`,
+          isError: true,
+        },
+      ],
+      meta: {
+        durationMs: Date.now() - startedAt,
+        agentMeta: {
+          sessionId: state.sessionId,
+          provider: params.providerOverride || "anthropic",
+          model: params.modelOverride || "claude-opus-4-6",
+        },
+        error: {
+          kind: "retry_limit" as const,
+          message,
+        },
+      },
+    };
+  }
+
+  // Emit a session transcript update so the dashboard refreshes if connected.
+  try {
+    emitSessionTranscriptUpdate(params.sessionFile);
+  } catch {
+    // Best-effort observability.
+  }
+
+  if (result.status !== "ok") {
+    const errorText =
+      result.status === "timeout"
+        ? "Philippe took too long to reply. Try again?"
+        : `Philippe hit an error: ${result.error ?? "unknown"}`;
+    return {
+      payloads: [{ text: errorText, isError: true }],
+      meta: {
+        durationMs: result.durationMs,
+        agentMeta: {
+          sessionId: result.sessionId,
+          provider: params.providerOverride || "anthropic",
+          model: params.modelOverride || "claude-opus-4-6",
+        },
+        error: {
+          kind: "retry_limit" as const,
+          message: result.error ?? result.status,
+        },
+      },
+    };
+  }
+
+  return {
+    payloads: [{ text: result.output }],
+    meta: {
+      durationMs: result.durationMs,
+      agentMeta: {
+        sessionId: result.sessionId,
+        provider: params.providerOverride || "anthropic",
+        model: params.modelOverride || "claude-opus-4-6",
+      },
+      stopReason: "end_turn",
+    },
+  };
 }
 
 export function buildAcpResult(params: {
