@@ -599,6 +599,18 @@ export async function runMainChatViaClaudep(params: {
   // Persist initial state so the session ID is durable even if claudep crashes.
   await persistState(state);
 
+  // [claudep-fork] Main-chat timeout. Default 25 minutes — Philippe sometimes
+  // spends several minutes running batch CLI commands (openclaw cron updates,
+  // file edits, etc.) and 10 minutes was proving too tight. Tunable via
+  // CLAUDEP_MAIN_TIMEOUT_MS env var.
+  const claudepTimeoutMs = (() => {
+    const raw = Number(process.env.CLAUDEP_MAIN_TIMEOUT_MS);
+    if (Number.isFinite(raw) && raw > 0) {
+      return raw;
+    }
+    return 25 * 60 * 1000;
+  })();
+
   let result: ClaudepRunWithSessionResult;
   try {
     result = await runClaudepPWithSession({
@@ -607,7 +619,7 @@ export async function runMainChatViaClaudep(params: {
       state,
       onStateUpdate: persistState,
       abortSignal: params.abortSignal,
-      timeoutMs: params.timeoutMs,
+      timeoutMs: claudepTimeoutMs,
       workingDir: params.workspaceDir,
     });
   } catch (err) {
