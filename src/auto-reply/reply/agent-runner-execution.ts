@@ -7,6 +7,10 @@ import {
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { runCliAgent } from "../../agents/cli-runner.js";
 import { getCliSessionBinding } from "../../agents/cli-session.js";
+import {
+  logClaudepDecision,
+  runMainChatViaClaudep,
+} from "../../agents/command/attempt-execution.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch.js";
 import { runWithModelFallback, isFallbackSummaryError } from "../../agents/model-fallback.js";
 import { isCliProvider } from "../../agents/model-selection.js";
@@ -171,6 +175,58 @@ export async function runAgentTurnWithFallback(params: {
   const directlySentBlockKeys = new Set<string>();
 
   const runId = params.opts?.runId ?? crypto.randomUUID();
+
+  // [claudep-fork] Main chat via claudep -p --session-id.
+  // Telegram messages to the main agent get routed through the Claude Max
+  // subscription via a shell-out, preserving conversation continuity through
+  // a persistent Claude Code session UUID. Opt out with OPENCLAW_CLAUDEP_MAIN_CHAT=0.
+  {
+    const claudepDisabled = process.env.OPENCLAW_CLAUDEP_MAIN_CHAT === "0";
+    const agentId = params.followupRun.run.agentId;
+    const sessionEntry = params.getActiveSessionEntry();
+    const spawnDepth = sessionEntry?.spawnDepth ?? 0;
+    const activate = !claudepDisabled && agentId === "main" && spawnDepth === 0;
+    logClaudepDecision(
+      `path=agent-runner agent=${sanitizeForLog(String(agentId ?? "?"))} spawnDepth=${spawnDepth} disabled=${claudepDisabled} activate=${activate}`,
+    );
+    if (activate) {
+      try {
+        const claudepResult = await runMainChatViaClaudep({
+          cfg: params.followupRun.run.config,
+          sessionEntry,
+          sessionKey: params.sessionKey,
+          sessionStore: params.activeSessionStore,
+          storePath: params.storePath,
+          sessionFile: params.followupRun.run.sessionFile ?? "",
+          workspaceDir: params.followupRun.run.workspaceDir,
+          prompt: params.commandBody,
+          abortSignal: params.opts?.abortSignal,
+          timeoutMs: 10 * 60 * 1000,
+          providerOverride: params.followupRun.run.provider ?? "anthropic",
+          modelOverride: params.followupRun.run.model ?? "claude-opus-4-6",
+        });
+        return {
+          kind: "success",
+          runId,
+          runResult: claudepResult,
+          fallbackAttempts: [],
+          didLogHeartbeatStrip: false,
+          autoCompactionCount: 0,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logClaudepDecision(`path=agent-runner FAILED ${message}`);
+        return {
+          kind: "final",
+          payload: {
+            text: `Philippe had a moment. (${message})`,
+            isError: true,
+          },
+        };
+      }
+    }
+  }
+
   const normalizeReplyMediaPaths = createReplyMediaPathNormalizer({
     cfg: params.followupRun.run.config,
     sessionKey: params.sessionKey,

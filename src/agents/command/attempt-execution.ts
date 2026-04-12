@@ -17,11 +17,27 @@ import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js
 import { sanitizeForLog } from "../../terminal/ansi.js";
 import { resolveMessageChannel } from "../../utils/message-channel.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../bootstrap-budget.js";
+import fsSync from "node:fs";
+import pathNode from "node:path";
+import osNode from "node:os";
 import {
   newSessionState,
   runClaudepPWithSession,
   type ClaudepRunWithSessionResult,
 } from "../claudep-runner.js";
+
+// [claudep-fork] Diagnostic logger for the claudep intercept decision.
+// Writes synchronously so we can trace the decision even when the intercept
+// never fires (i.e., runClaudepPWithSession never gets a chance to log).
+export function logClaudepDecision(msg: string): void {
+  try {
+    const file = pathNode.join(osNode.homedir(), "tmp", "clawtracker.txt");
+    fsSync.mkdirSync(pathNode.dirname(file), { recursive: true });
+    fsSync.appendFileSync(file, `[${new Date().toISOString()}] DECISION | ${msg}\n`);
+  } catch {
+    // Best-effort.
+  }
+}
 import { runCliAgent } from "../cli-runner.js";
 import { clearCliSession, getCliSessionBinding, setCliSessionBinding } from "../cli-session.js";
 import { FailoverError } from "../failover-error.js";
@@ -353,15 +369,14 @@ export function runAgentAttempt(params: {
       : undefined;
 
   // [claudep-fork] Main chat via claudep -p --session-id.
-  // When OPENCLAW_CLAUDEP_MAIN_CHAT=1 is set, the main agent's execution is
-  // routed through the Claude Max subscription (claudep -p) instead of the
-  // embedded Pi agent. This preserves Philippe's personality and memory
-  // continuity without burning API tokens on every turn.
-  if (
-    process.env.OPENCLAW_CLAUDEP_MAIN_CHAT === "1" &&
-    params.sessionAgentId === "main" &&
-    (params.sessionEntry?.spawnDepth ?? 0) === 0
-  ) {
+  const claudepMainChatDisabled = process.env.OPENCLAW_CLAUDEP_MAIN_CHAT === "0";
+  const spawnDepth = params.sessionEntry?.spawnDepth ?? 0;
+  const claudepWouldActivate =
+    !claudepMainChatDisabled && params.sessionAgentId === "main" && spawnDepth === 0;
+  logClaudepDecision(
+    `agent=${sanitizeForLog(params.sessionAgentId)} spawnDepth=${spawnDepth} disabled=${claudepMainChatDisabled} activate=${claudepWouldActivate}`,
+  );
+  if (claudepWouldActivate) {
     return runMainChatViaClaudep({
       cfg: params.cfg,
       sessionEntry: params.sessionEntry,
@@ -526,7 +541,7 @@ export function runAgentAttempt(params: {
  * the caller can deliver to the user. Falls back from --resume to --session-id
  * to new-session as needed. Rollover is handled by runClaudepPWithSession.
  */
-async function runMainChatViaClaudep(params: {
+export async function runMainChatViaClaudep(params: {
   cfg: ReturnType<typeof loadConfig>;
   sessionEntry: SessionEntry | undefined;
   sessionKey: string | undefined;
